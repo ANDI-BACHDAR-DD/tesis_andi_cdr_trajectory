@@ -39,6 +39,7 @@ const VisualizationPage = () => {
   const [messages, setMessages] = useState([]);
   const [inputMessage, setInputMessage] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const [selectedPolyline, setSelectedPolyline] = useState(null);
 
 
 
@@ -471,6 +472,8 @@ const VisualizationPage = () => {
 
                           const prev = validGpsRecords[i - 1];
 
+                          const isSelected = selectedPolyline === i;
+
                           return (
                             <Polyline
                               key={`seg-${i}`}
@@ -478,12 +481,39 @@ const VisualizationPage = () => {
                                 [prev.a_lat, prev.a_long],
                                 [r.a_lat, r.a_long]
                               ]}
+                              className={isSelected ? "animate-pulse-line" : ""}
                               pathOptions={{
-                                color: getActivityColor(r.calltype),
-                                weight: 4,
-                                opacity: 0.9
+                                color: isSelected ? '#ef4444' : getActivityColor(r.calltype),
+                                weight: isSelected ? 8 : 4,
+                                opacity: isSelected ? 1 : 0.9
                               }}
-                            />
+                              eventHandlers={{
+                                click: () => setSelectedPolyline(i)
+                              }}
+                            >
+                              <Popup>
+                                <div className="space-y-1 text-sm min-w-[200px]">
+                                  <div className="font-semibold text-purple-700 border-b pb-1 mb-1">Jalur Trajectory</div>
+                                  <div className="text-xs space-y-2">
+                                    <div>
+                                      <strong className="text-gray-600">📍 Titik Asal (Record #{i}):</strong><br />
+                                      Waktu: <span className="font-medium text-blue-600 bg-blue-50 px-1 py-0.5 rounded">{prev.time_readable || prev.time || "N/A"}</span><br />
+                                      Lokasi: {prev.a_lat.toFixed(5)}, {prev.a_long.toFixed(5)}
+                                    </div>
+                                    <div className="border-t my-1"></div>
+                                    <div>
+                                      <strong className="text-gray-600">🎯 Titik Tujuan (Record #{i + 1}):</strong><br />
+                                      Waktu: <span className="font-medium text-blue-600 bg-blue-50 px-1 py-0.5 rounded">{r.time_readable || r.time || "N/A"}</span><br />
+                                      Lokasi: {r.a_lat.toFixed(5)}, {r.a_long.toFixed(5)}
+                                    </div>
+                                    <div className="border-t my-1"></div>
+                                    <div>
+                                      <strong className="text-gray-600">Aktivitas di Tujuan:</strong> {getActivityIcon(r.calltype)} {r.calltype || "N/A"}
+                                    </div>
+                                  </div>
+                                </div>
+                              </Popup>
+                            </Polyline>
                           );
                         })
                       }
@@ -509,7 +539,7 @@ const VisualizationPage = () => {
 
                               <div className="text-xs space-y-1">
 
-                                <div><strong>Waktu:</strong> {record.time || "N/A"}</div>
+                                <div><strong>Waktu:</strong>  <span className="font-medium text-blue-600 bg-blue-50 px-1 py-0.5 rounded">{record.time_readable || record.time || "N/A"}</span></div>
                                 <div><strong>Latitude:</strong> {typeof record.a_lat === "number" ? record.a_lat.toFixed(6) : "N/A"}</div>
                                 <div><strong>Longitude:</strong> {typeof record.a_long === "number" ? record.a_long.toFixed(6) : "N/A"}</div>
 
@@ -582,9 +612,9 @@ const VisualizationPage = () => {
                     <div className="space-y-1">
                       <div className="text-xs text-gray-500 flex items-center space-x-1">
                         <Clock className="w-3 h-3" />
-                        <span>Timestamp</span>
+                        <span>Waktu (WIB)</span>
                       </div>
-                      <div className="font-semibold">{selectedRecord.time || 'N/A'}</div>
+                      <div className="font-semibold text-xs text-blue-600 bg-blue-50 inline-block px-1 py-0.5 rounded mt-1">{selectedRecord.time_readable || selectedRecord.time || 'N/A'}</div>
                     </div>
                     <div className="space-y-1">
                       <div className="text-xs text-gray-500 flex items-center space-x-1">
@@ -856,7 +886,7 @@ const VisualizationPage = () => {
                       {records.slice(0, 50).map((record, index) => (
                         <tr key={record.id || index} className="border-b hover:bg-gray-50">
                           <td className="p-2">{index + 1}</td>
-                          <td className="p-2">{record.time || 'N/A'}</td>
+                          <td className="p-2 whitespace-nowrap">{record.time_readable || record.time || 'N/A'}</td>
                           <td className="p-2">{typeof record.a_lat === 'number' ? record.a_lat.toFixed(6) : (record.a_lat ? Number(record.a_lat).toFixed(6) : 'N/A')}</td>
                           <td className="p-2">{typeof record.a_long === 'number' ? record.a_long.toFixed(6) : (record.a_long ? Number(record.a_long).toFixed(6) : 'N/A')}</td>
                           <td className="p-2 text-xs">{record.a_lac_cid || 'N/A'}</td>

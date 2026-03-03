@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any, Generator
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import openpyxl
 import pandas as pd
 import io
@@ -699,6 +699,19 @@ async def get_records(upload_id: str):
         "a_long": {"$ne": None}
     }
     rows = await db.cdr_records.find(query, {"_id": 0}).sort("timestamp", 1).to_list(5000)
+    
+    tz_jkt = timezone(timedelta(hours=7))
+    for row in rows:
+        t_val = row.get("time")
+        time_readable = None
+        if t_val:
+            try:
+                dt = datetime.fromtimestamp(float(t_val), tz=tz_jkt)
+                time_readable = dt.strftime('%Y-%m-%d %H:%M:%S')
+            except (ValueError, TypeError):
+                pass
+        row["time_readable"] = time_readable
+
     return {"records": rows, "count": len(rows)}
 
 

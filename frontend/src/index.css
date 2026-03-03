@@ -113,3 +113,14 @@ code {
         border-bottom-color: inherit;
     }
 }
+
+@keyframes pulse-line-glow {
+  0% { filter: drop-shadow(0 0 2px rgba(239, 68, 68, 0.6)); stroke-width: 6; }
+  50% { filter: drop-shadow(0 0 10px rgba(239, 68, 68, 1)); stroke-width: 8; }
+  100% { filter: drop-shadow(0 0 2px rgba(239, 68, 68, 0.6)); stroke-width: 6; }
+}
+
+.animate-pulse-line {
+  animation: pulse-line-glow 1.5s infinite;
+  z-index: 1000;
+}
