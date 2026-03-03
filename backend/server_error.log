@@ -1,0 +1,12 @@
+INFO:     Started server process [61859]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-03-03 09:51:14,514 - server - INFO - Upload dimulai: test.csv (CSV)
+2026-03-03 09:51:14,515 - server - INFO - File diterima: test.csv, ukuran 0.0 MB
+2026-03-03 09:51:14,515 - server - INFO - CSV sniffed delimiter: ','
+2026-03-03 09:51:14,562 - server - INFO - CSV chunk 1: inserted 2 rows (total: 2)
+2026-03-03 09:51:14,563 - server - INFO - CSV parse complete: 1 chunks, 2 rows
+2026-03-03 09:51:14,566 - server - INFO - ✅ Upload selesai: test.csv → 2 records (upload_id=7f08a592-e231-43b7-9a06-308c319349d5)
+INFO:     127.0.0.1:50347 - "POST /api/upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50352 - "POST /api/analyze HTTP/1.1" 200 OK

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,7 +6,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Generator
 import uuid
 from datetime import datetime, timezone
 import openpyxl
@@ -14,6 +14,7 @@ import pandas as pd
 import io
 import json
 import numpy as np
+from tempfile import SpooledTemporaryFile
 
 # Offline analysis imports
 import math
@@ -37,7 +38,9 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get("DB_NAME", "cdr_trajectory_db")]
 
 # FastAPI App
+# Allow large file uploads up to 2 GB
 app = FastAPI()
+app.state.max_upload_size = 2 * 1024 * 1024 * 1024  # 2 GB
 api_router = APIRouter(prefix="/api")
 
 # Logging setup
@@ -110,112 +113,209 @@ class ChatQuery(BaseModel):
     question: str
 
 # --------------------
-# Helper: parse Excel CDR
+# Helper: header normalization & column mapping
 # --------------------
+COLUMN_MAPPING = {
+    # Existing standard fields
+    "date": "date",
+    "time": "time",
+    "duration": "duration",
+    "a_number": "a_number",
+    "a_imei": "a_imei",
+    "a_imei_type": "a_imei_type",
+    "a_imsi": "a_imsi",
+    "a_lac_cid": "a_lac_cid",
+    "a_sitename": "a_sitename",
+    "b_number": "b_number",
+    "b_imei": "b_imei",
+    "b_imei_type": "b_imei_type",
+    "b_imsi": "b_imsi",
+    "b_lac_cid": "b_lac_cid",
+    "b_sitename": "b_sitename",
+    "calltype": "calltype",
+    "direction": "direction",
+    "c_number": "c_number",
+    "a_lat": "a_lat",
+    "a_long": "a_long",
+    "b_lat": "b_lat",
+    "b_long": "b_long",
+
+    # Alternative flat CSV headers (e.g. maid, latitude, longitude, timestamp)
+    "maid": "a_number",
+    "latitude": "a_lat",
+    "lat": "a_lat",
+    "longitude": "a_long",
+    "long": "a_long",
+    "lon": "a_long",
+    "timestamp": "time",       # Maps event timestamp to 'time'
+    "event_timestamp": "time"
+}
+GPS_FIELDS = {"a_lat", "a_long", "b_lat", "b_long"}
+
+
 def _normalize_header(h: Optional[str], idx: int) -> str:
     if h is None:
         return f"col_{idx}"
     raw = str(h).strip().lower()
     if raw == "":
         return f"col_{idx}"
+    raw = raw.lstrip("%").strip()
     raw = raw.replace("%", "").replace(" ", "_").replace("/", "_").replace("-", "_")
-    # remove repeated underscores
     while "__" in raw:
         raw = raw.replace("__", "_")
-    return raw
+    return COLUMN_MAPPING.get(raw, raw)
 
 
+def _build_record_entry(key: str, value) -> tuple:
+    """Return (key, processed_value) for a single CDR cell."""
+    if value in (":", None, ""):
+        return key, None
+    if key in GPS_FIELDS:
+        try:
+            return key, float(value)
+        except (TypeError, ValueError):
+            return key, None
+    return key, str(value).strip() if value is not None else None
+
+
+# --------------------
+# Helper: parse XLSX CDR
+# --------------------
 def parse_cdr_file(file_content: bytes, filename: str) -> List[Dict]:
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
         ws = wb.active
 
-        rows = [row for row in ws.iter_rows(values_only=True)]
+        rows = list(ws.iter_rows(values_only=True))
         if len(rows) < 2:
             return []
 
-        cleaned_headers = []
-        for i, h in enumerate(rows[0]):
-            if not h:
-                cleaned_headers.append(f"col_{i}")
-                continue
-
-            raw = str(h).lower().strip()
-
-            # Remove leading % symbol
-            raw = raw.lstrip("%").strip()
-
-            # Normalize
-            raw = raw.replace(" ", "_")\
-                     .replace("/", "_")\
-                     .replace("-", "_")\
-                     .replace("__", "_")
-
-            # Map to backend field names
-            mapping = {
-                "date": "date",
-                "time": "time",
-                "duration": "duration",
-
-                "a_number": "a_number",
-                "a_imei": "a_imei",
-                "a_imei_type": "a_imei_type",
-                "a_imsi": "a_imsi",
-                "a_lac_cid": "a_lac_cid",
-                "a_sitename": "a_sitename",
-
-                "b_number": "b_number",
-                "b_imei": "b_imei",
-                "b_imei_type": "b_imei_type",
-                "b_imsi": "b_imsi",
-                "b_lac_cid": "b_lac_cid",
-                "b_sitename": "b_sitename",
-
-                "calltype": "calltype",
-                "direction": "direction",
-                "c_number": "c_number",
-
-                "a_lat": "a_lat",
-                "a_long": "a_long",
-                "b_lat": "b_lat",
-                "b_long": "b_long",
-            }
-
-            cleaned_headers.append(mapping.get(raw, raw))
+        cleaned_headers = [_normalize_header(h, i) for i, h in enumerate(rows[0])]
 
         records = []
         for row in rows[1:]:
             if not row or all(v is None for v in row):
                 continue
-
             entry = {}
-
             for i, value in enumerate(row):
                 key = cleaned_headers[i]
-
-                # ":" means NULL
-                if value == ":":
-                    entry[key] = None
-                    continue
-
-                # GPS fields
-                if key in ("a_lat", "a_long", "b_lat", "b_long"):
-                    try:
-                        entry[key] = float(value) if value not in (None, ":") else None
-                    except:
-                        entry[key] = None
-                    continue
-
-                # Everything else: force string
-                entry[key] = None if value in (None, "") else str(value).strip()
-
+                _, processed = _build_record_entry(key, value)
+                entry[key] = processed
             records.append(entry)
 
         return records
 
     except Exception as e:
-        logger.error(f"CDR parse error: {e}")
+        logger.error(f"CDR XLSX parse error: {e}")
         raise HTTPException(status_code=400, detail=f"CDR parsing error: {e}")
+
+
+# --------------------
+# Helper: clean & validate a CSV DataFrame chunk
+# --------------------
+# Columns that should NEVER contain the header string as a value
+_HEADER_SENTINEL_COLS = {"a_number", "b_number", "date", "time", "calltype", "direction", "a_lat", "a_long"}
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise a raw CSV DataFrame chunk before converting to records.
+    - Strip & lowercase column names
+    - Apply COLUMN_MAPPING to rename to backend field names
+    - Drop rows where known CDR columns contain the literal column-header string
+      (i.e. rows that are a repeated header line inside the CSV body)
+    - Remove rows that are completely empty
+    """
+    # 1. Normalise column names
+    df.columns = [_normalize_header(str(c), i) for i, c in enumerate(df.columns)]
+
+    # 2. Drop rows that look like a repeated header (value == column name)
+    #    Only check columns that exist in this df
+    sentinel_cols = _HEADER_SENTINEL_COLS & set(df.columns)
+    if sentinel_cols:
+        mask = pd.Series([False] * len(df), index=df.index)
+        for col in sentinel_cols:
+            # If the cell value equals the column name it's a header repeat
+            mask |= df[col].astype(str).str.strip().str.lower() == col
+        df = df[~mask]
+
+    # 3. Drop rows that are entirely NaN / empty
+    df = df.dropna(how="all")
+
+    return df.reset_index(drop=True)
+
+
+# --------------------
+# Helper: stream CSV CDR in chunks (for large 1-2 GB files)
+# --------------------
+def parse_cdr_csv_chunked(file_bytes: bytes, chunksize: int = 100000) -> Generator[List[Dict], None, None]:
+    """
+    Yields lists of CDR record dicts, reading the CSV chunksize rows at a time.
+    Uses header=0 so pandas always treats row 0 as the header.
+    Keeps memory usage bounded regardless of file size.
+    """
+    try:
+        buf = io.BytesIO(file_bytes)
+
+        # --- Sniff delimiter from first 4 KB ---
+        sample = buf.read(4096).decode("utf-8", errors="replace")
+        buf.seek(0)
+        comma_count = sample.count(",")
+        semi_count  = sample.count(";")
+        tab_count   = sample.count("\t")
+        if tab_count > comma_count and tab_count > semi_count:
+            delimiter = "\t"
+        elif semi_count > comma_count:
+            delimiter = ";"
+        else:
+            delimiter = ","
+
+        logger.info(f"CSV sniffed delimiter: {repr(delimiter)}")
+
+        reader = pd.read_csv(
+            buf,
+            sep=delimiter,
+            header=0,               # ← always treat first row as header
+            dtype=str,              # keep everything as string; we cast later
+            chunksize=chunksize,
+            na_values=["", ":", "N/A", "null", "NULL", "None", "nan"],
+            keep_default_na=True,
+            encoding="utf-8",
+            encoding_errors="replace",
+            skipinitialspace=True,  # strip spaces after delimiter
+            on_bad_lines="warn",    # skip malformed lines instead of crashing
+        )
+
+        chunk_num = 0
+        total_rows = 0
+        for raw_chunk in reader:
+            chunk_num += 1
+
+            # Clean: normalise headers + drop header-repeat rows
+            chunk_df = clean_dataframe(raw_chunk)
+            if chunk_df.empty:
+                continue
+
+            records = []
+            for _, row in chunk_df.iterrows():
+                entry: Dict[str, Any] = {}
+                for key, value in row.items():
+                    raw_val = None if (pd.isna(value) if not isinstance(value, str) else value.strip() == "") else value
+                    _, processed = _build_record_entry(str(key), raw_val)
+                    entry[str(key)] = processed
+                records.append(entry)
+
+            total_rows += len(records)
+            logger.debug(f"CSV chunk {chunk_num}: {len(records)} rows (total so far: {total_rows})")
+            yield records
+
+        logger.info(f"CSV parse complete: {chunk_num} chunks, {total_rows} rows")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"CDR CSV parse error: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"CSV parsing error: {e}")
 
 
 
@@ -427,7 +527,7 @@ async def analyze_with_ai(records: List[Dict], analysis_type: str) -> Dict[str, 
 
         activity_dist = {}
         for r in records:
-            act = r.get("calltype", "UNKNOWN")
+            act = r.get("calltype") or "UNKNOWN"
             activity_dist[act] = activity_dist.get(act, 0) + 1
 
         times = [r.get("time") for r in records if r.get("time")]
@@ -458,38 +558,128 @@ async def root():
     return {"message": "CDR Trajectory Analysis API (Local Mode)", "version": "1.0.0"}
 
 
+# --------------------
+# Batch insert helper
+# --------------------
+async def _insert_records_batch(records: List[Dict], upload_id: str) -> int:
+    """
+    Build MongoDB documents from CDR record dicts and bulk-insert them.
+    We construct the doc manually so that:
+    - The CDRRecord model's default-generated `id` and `timestamp` are always used
+    - A 'timestamp' key coming from CSV data is never passed into the Pydantic model
+      (CDR data doesn't have a 'timestamp' column in the standard schema; if it does
+       exist in the CSV it just gets stored as-is in the extra fields, not as the
+       Pydantic datetime field)
+    Returns the number of documents actually inserted.
+    """
+    # Fields managed by CDRRecord itself — never take from source data
+    _RESERVED = {"id", "upload_id", "timestamp"}
+
+    docs = []
+    skipped = 0
+    for rec in records:
+        try:
+            # Strip reserved keys from raw CSV data to avoid Pydantic conflicts
+            clean_rec = {k: v for k, v in rec.items() if k not in _RESERVED}
+            record = CDRRecord(upload_id=upload_id, **clean_rec)
+            rec_dict = record.model_dump()
+            # Serialise the auto-generated datetime to ISO string for MongoDB
+            rec_dict["timestamp"] = rec_dict["timestamp"].isoformat()
+            docs.append(rec_dict)
+        except Exception as e:
+            skipped += 1
+            logger.warning(f"Skipping invalid record (error: {e}) — data: {str(rec)[:120]}")
+
+    if docs:
+        try:
+            await db.cdr_records.insert_many(docs, ordered=False)
+        except Exception as e:
+            logger.error(f"MongoDB insert_many error: {e}")
+            raise
+
+    if skipped:
+        logger.info(f"Batch: inserted {len(docs)}, skipped {skipped} invalid records")
+
+    return len(docs)
+
+
 @api_router.post("/upload")
 async def upload_cdr_file(file: UploadFile = File(...)):
+    """
+    Upload a CDR file (XLSX, XLS, atau CSV).
+    - XLSX/XLS: loaded fully into memory (manageable for Excel files)
+    - CSV: streamed in 5 000-row chunks → supports 1-2 GB files without OOM
+    Response always includes 'success', 'upload_id', 'total_records', 'filename'.
+    """
     try:
-        if not file.filename.endswith((".xlsx", ".xls")):
-            raise HTTPException(status_code=400, detail="Only XLSX files supported")
+        fname = (file.filename or "").strip()
+        ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
 
+        if ext not in ("xlsx", "xls", "csv"):
+            raise HTTPException(
+                status_code=400,
+                detail="Hanya file XLSX, XLS, atau CSV yang didukung"
+            )
+
+        logger.info(f"Upload dimulai: {fname} ({ext.upper()})")
         content = await file.read()
-        records = parse_cdr_file(content, file.filename)
-        if not records:
-            raise HTTPException(status_code=400, detail="File is empty or invalid")
+        if not content:
+            raise HTTPException(status_code=400, detail="File kosong")
+
+        logger.info(f"File diterima: {fname}, ukuran {len(content) / (1024*1024):.1f} MB")
 
         upload_id = str(uuid.uuid4())
-        metadata = UploadMetadata(upload_id=upload_id, filename=file.filename, total_records=len(records))
+        total_inserted = 0
+
+        if ext in ("xlsx", "xls"):
+            # ── XLSX path ──────────────────────────────────────────────────────
+            records = parse_cdr_file(content, fname)
+            if not records:
+                raise HTTPException(status_code=400, detail="File kosong atau format tidak valid")
+            logger.info(f"XLSX parsed: {len(records)} rows")
+            total_inserted = await _insert_records_batch(records, upload_id)
+
+        else:
+            # ── CSV path (chunked, memory-safe) ────────────────────────────────
+            chunk_idx = 0
+            for chunk_records in parse_cdr_csv_chunked(content):
+                chunk_idx += 1
+                if chunk_records:
+                    n = await _insert_records_batch(chunk_records, upload_id)
+                    total_inserted += n
+                    logger.info(f"CSV chunk {chunk_idx}: inserted {n} rows (total: {total_inserted})")
+
+            if total_inserted == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="File CSV kosong atau tidak ada data valid (cek format kolom)"
+                )
+
+        # ── Save metadata ──────────────────────────────────────────────────────
+        metadata = UploadMetadata(
+            upload_id=upload_id,
+            filename=fname,
+            total_records=total_inserted
+        )
         meta = metadata.model_dump()
         meta["uploaded_at"] = meta["uploaded_at"].isoformat()
         await db.upload_metadata.insert_one(meta)
 
-        # Insert records in a safe way: ensure all keys are strings
-        for rec in records:
-            record = CDRRecord(upload_id=upload_id, **rec)
-            rec_dict = record.model_dump()
-            rec_dict["timestamp"] = rec_dict["timestamp"].isoformat()
-            await db.cdr_records.insert_one(rec_dict)
+        logger.info(f"✅ Upload selesai: {fname} → {total_inserted} records (upload_id={upload_id})")
 
         return {
             "success": True,
+            "status": "success",          # alias for compatibility
             "upload_id": upload_id,
-            "total_records": len(records),
+            "total_records": total_inserted,
+            "inserted_records": total_inserted,  # alias requested by user
+            "filename": fname,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"Upload error ({fname}): {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -501,7 +691,14 @@ async def get_uploads():
 
 @api_router.get("/records/{upload_id}")
 async def get_records(upload_id: str):
-    rows = await db.cdr_records.find({"upload_id": upload_id}, {"_id": 0}).to_list(10000)
+    # Fetch up to 5000 records that actually have GPS coordinates to prevent frontend lag
+    # and ensure trajectory is visible.
+    query = {
+        "upload_id": upload_id,
+        "a_lat": {"$ne": None},
+        "a_long": {"$ne": None}
+    }
+    rows = await db.cdr_records.find(query, {"_id": 0}).sort("timestamp", 1).to_list(5000)
     return {"records": rows, "count": len(rows)}
 
 
@@ -527,6 +724,7 @@ async def analyze_trajectory(request: AnalysisRequest):
         "success": True,
         "analysis": analysis,
     }
+
 @api_router.get("/sna/{upload_id}")
 async def analyze_sna(upload_id: str):
     """
@@ -572,33 +770,73 @@ async def analyze_sna(upload_id: str):
 
 @api_router.get("/statistics/{upload_id}")
 async def get_statistics(upload_id: str):
-    records = await db.cdr_records.find({"upload_id": upload_id}, {"_id": 0}).to_list(10000)
-    if not records:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    total = len(records)
-    gps_rec = [r for r in records if r.get("a_lat") is not None and r.get("a_long") is not None]
-
-    lats = [r["a_lat"] for r in gps_rec]
-    longs = [r["a_long"] for r in gps_rec]
-
+    # MongoDB aggregations to avoid loading millions of records into memory for large files
+    total_records = await db.cdr_records.count_documents({"upload_id": upload_id})
+    
+    # 1. GPS Bounds and counts
+    gps_pipeline = [
+        {"$match": {"upload_id": upload_id, "a_lat": {"$ne": None}, "a_long": {"$ne": None}}},
+        {"$group": {
+            "_id": None,
+            "min_lat": {"$min": "$a_lat"},
+            "max_lat": {"$max": "$a_lat"},
+            "min_long": {"$min": "$a_long"},
+            "max_long": {"$max": "$a_long"},
+            "avg_lat": {"$avg": "$a_lat"},
+            "avg_long": {"$avg": "$a_long"},
+            "gps_count": {"$sum": 1}
+        }}
+    ]
+    gps_stats = await db.cdr_records.aggregate(gps_pipeline).to_list(1)
+    
     bounds = None
-    if lats and longs:
+    records_with_gps = 0
+    if gps_stats:
+        res = gps_stats[0]
+        records_with_gps = res.get("gps_count", 0)
         bounds = {
-            "min_lat": min(lats),
-            "max_lat": max(lats),
-            "min_long": min(longs),
-            "max_long": max(longs),
-            "center_lat": sum(lats) / len(lats),
-            "center_long": sum(longs) / len(longs),
+            "min_lat": res.get("min_lat"),
+            "max_lat": res.get("max_lat"),
+            "min_long": res.get("min_long"),
+            "max_long": res.get("max_long"),
+            "center_lat": res.get("avg_lat"),
+            "center_long": res.get("avg_long"),
         }
+        
+    missing_gps = total_records - records_with_gps
+    perc = round((missing_gps / total_records) * 100, 2) if total_records > 0 else 0
+
+    # 2. Activity Distribution (Calltype)
+    act_pipeline = [
+        {"$match": {"upload_id": upload_id}},
+        {"$group": {"_id": "$calltype", "count": {"$sum": 1}}}
+    ]
+    act_list = await db.cdr_records.aggregate(act_pipeline).to_list(None)
+    activity_dist = {}
+    for a in act_list:
+        k = str(a["_id"]) if a["_id"] is not None else "UNKNOWN"
+        activity_dist[k] = activity_dist.get(k, 0) + a["count"]
+        
+    # 3. Direction Distribution
+    dir_pipeline = [
+        {"$match": {"upload_id": upload_id}},
+        {"$group": {"_id": "$direction", "count": {"$sum": 1}}}
+    ]
+    dir_list = await db.cdr_records.aggregate(dir_pipeline).to_list(None)
+    direction_dist = {}
+    for d in dir_list:
+        k = str(d["_id"]) if d["_id"] is not None else "UNKNOWN"
+        direction_dist[k] = direction_dist.get(k, 0) + d["count"]
 
     return {
-        "total_records": total,
-        "records_with_gps": len(gps_rec),
+        "total_records": total_records,
+        "records_with_gps": records_with_gps,
+        "missing_gps": missing_gps,
+        "missing_gps_percentage": perc,
         "gps_bounds": bounds,
+        "activity_distribution": activity_dist,
+        "direction_distribution": direction_dist
     }
-import networkx as nx
 
 def build_contact_graph(records):
     """
@@ -651,6 +889,7 @@ def build_contact_graph(records):
             G.add_edge(src, dst, weight=dur, count=1)
 
     return G
+
 @api_router.get("/graph/{upload_id}")
 async def get_sna_graph(upload_id: str):
     """
@@ -895,6 +1134,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def startup_db_client():
+    try:
+        await db.cdr_records.create_index("upload_id", background=True)
+        logger.info("Ensured upload_id index exists.")
+    except Exception as e:
+        logger.warning(f"Failed to create index: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

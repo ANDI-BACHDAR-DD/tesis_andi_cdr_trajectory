@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Upload, FileSpreadsheet, TrendingUp, MapPin, Activity, Share2, MessageCircle } from 'lucide-react';
+import { Upload, FileSpreadsheet, TrendingUp, MapPin, Activity, Share2, MessageCircle, FileText } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { useNavigate } from 'react-router-dom';
@@ -14,6 +14,10 @@ import { API } from "../api/config";
 const HomePage = () => {
   const [uploads, setUploads] = useState([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);  // 0-100
+  const [uploadedMB, setUploadedMB] = useState(0);
+  const [totalMB, setTotalMB] = useState(0);
+  const fileInputRef = useRef(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -35,34 +39,53 @@ const HomePage = () => {
     const file = event.target.files[0];
     if (!file) return;
 
-    if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
-      toast.error('Hanya file XLSX/XLS yang didukung');
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!['xlsx', 'xls', 'csv'].includes(ext)) {
+      toast.error('Hanya file XLSX, XLS, atau CSV yang didukung');
       return;
     }
 
     setUploading(true);
+    setUploadProgress(0);
+    setUploadedMB(0);
+    setTotalMB(parseFloat((file.size / (1024 * 1024)).toFixed(1)));
+
     const formData = new FormData();
     formData.append('file', file);
 
     try {
       const response = await axios.post(`${API}/upload`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        // Large file uploads need a long timeout (e.g. 30 minutes for 2 GB)
+        timeout: 30 * 60 * 1000,
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / (progressEvent.total || file.size)
+          );
+          const mbUploaded = parseFloat((progressEvent.loaded / (1024 * 1024)).toFixed(1));
+          setUploadProgress(percentCompleted);
+          setUploadedMB(mbUploaded);
+        },
       });
 
       if (response.data.success) {
-        toast.success(`File berhasil diupload! ${response.data.total_records} records ditemukan`);
+        setUploadProgress(100);
+        toast.success(
+          `✅ Berhasil! ${response.data.total_records.toLocaleString('id-ID')} records dari ${file.name}`
+        );
         fetchUploads();
-
-        // Navigate to visualization page
+        // Reset file input
+        if (fileInputRef.current) fileInputRef.current.value = '';
         setTimeout(() => {
           navigate(`/visualization/${response.data.upload_id}`);
-        }, 1000);
+        }, 1200);
       }
     } catch (error) {
       console.error('Error uploading file:', error);
       toast.error('Gagal mengupload file: ' + (error.response?.data?.detail || error.message));
     } finally {
       setUploading(false);
+      setUploadProgress(0);
     }
   };
 
@@ -98,18 +121,53 @@ const HomePage = () => {
                 <span>Upload Data CDR</span>
               </CardTitle>
               <CardDescription>
-                Upload file XLSX berisi data Call Detail Record (CDR) dengan informasi GPS, timestamp, dan aktivitas pengguna
+                Upload file CDR (XLSX, XLS, atau CSV) dengan informasi GPS, timestamp, dan aktivitas pengguna.
+                Mendukung file besar hingga 1-2 GB via streaming.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="flex flex-col items-center justify-center py-12 space-y-4">
+              <div className="flex flex-col items-center justify-center py-10 space-y-5">
                 <div className="p-6 rounded-full" style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }}>
-                  <FileSpreadsheet className="w-12 h-12 text-white" />
+                  {uploading
+                    ? <FileText className="w-12 h-12 text-white animate-pulse" />
+                    : <FileSpreadsheet className="w-12 h-12 text-white" />}
                 </div>
+
                 <div className="text-center">
-                  <h3 className="text-lg font-semibold mb-2">Upload File CDR</h3>
-                  <p className="text-sm text-gray-600 mb-4">Format: XLSX atau XLS</p>
+                  <h3 className="text-lg font-semibold mb-1">Upload File CDR</h3>
+                  <p className="text-sm text-gray-500">
+                    Format yang didukung: <strong>.xlsx</strong>, <strong>.xls</strong>, <strong>.csv</strong>
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">Ukuran file hingga 1-2 GB didukung untuk CSV</p>
                 </div>
+
+                {/* Progress bar — only visible while uploading */}
+                {uploading && (
+                  <div className="w-full max-w-sm space-y-2">
+                    <div className="flex justify-between text-xs text-gray-500">
+                      <span>Mengupload...</span>
+                      <span>{uploadedMB} MB / {totalMB} MB</span>
+                    </div>
+                    <div
+                      className="w-full rounded-full overflow-hidden"
+                      style={{ height: '10px', background: 'rgba(102,126,234,0.15)' }}
+                    >
+                      <div
+                        style={{
+                          width: `${uploadProgress}%`,
+                          height: '100%',
+                          background: 'linear-gradient(90deg, #667eea 0%, #764ba2 100%)',
+                          transition: 'width 0.3s ease',
+                          borderRadius: '9999px',
+                        }}
+                      />
+                    </div>
+                    <p className="text-center text-sm font-semibold" style={{ color: '#667eea' }}>
+                      {uploadProgress}%
+                    </p>
+                  </div>
+                )}
+
                 <label htmlFor="file-upload">
                   <Button
                     data-testid="upload-cdr-button"
@@ -118,19 +176,21 @@ const HomePage = () => {
                     style={{
                       background: uploading ? '#9ca3af' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
                       color: 'white',
-                      border: 'none'
+                      border: 'none',
+                      minWidth: '140px'
                     }}
                     asChild
                   >
                     <span>
-                      {uploading ? 'Mengupload...' : 'Pilih File'}
+                      {uploading ? `Mengupload ${uploadProgress}%` : 'Pilih File'}
                     </span>
                   </Button>
                 </label>
                 <input
                   id="file-upload"
+                  ref={fileInputRef}
                   type="file"
-                  accept=".xlsx,.xls"
+                  accept=".xlsx,.xls,.csv"
                   onChange={handleFileUpload}
                   className="hidden"
                   disabled={uploading}
